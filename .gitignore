@@ -1,0 +1,7 @@
+# Editor/OS cruft
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
