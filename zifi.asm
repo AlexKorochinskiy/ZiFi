@@ -106,6 +106,14 @@ do_after_load	ld a,0
 
 main_ex		call wait_frame
 
+		ld a,(music_sw+1)	; draw the volume-bar analyzer here in the foreground,
+		or a			; frame-synced but off the raster-critical interrupt chain
+		jr z,skip_analizator
+		ld a,(save_mode+1)
+		or a
+		call nz,music_analizator
+skip_analizator
+
 do_start_music	ld a,1
 		or a
 		call z,music_init
@@ -2251,10 +2259,7 @@ music_sw	ld a,0
 
 		ld a,(save_mode+1)
 		or a
-		jr z,int_ex3	
-analizator_sw	ld a,1
-		or a
-		call nz,music_analizator
+		jr z,int_ex3
 
 enter_search_sw	ld a,0
 		or a
@@ -2268,6 +2273,8 @@ int_ex3		ld hl,0
 
 pt_play		call set_music_pages_lite
 		call music_player_play
+		call restore_music_pages_lite	; PAGE3 only needed for the tick itself -
+					; restore it before the (page-independent) link-blink/autoplay tail below
 
 show_now_play_link	ld a,0
 		or a
@@ -2326,7 +2333,7 @@ autoplay_num	ld a,0
 		call parse_url
 		ld a,1
 		ld (load_sw+1),a
-pt_play_ex	jp restore_music_pages_lite
+pt_play_ex	jp restore_music_pages_lite	; autoplay may have re-pointed page1 itself above - restore again
 /*
 SETUP	DB 0 ;set bit0, if you want to play without looping
 	     ;(optional);
@@ -2385,7 +2392,8 @@ music_analizator
 		ld hl,0
 		ld (analizator_screen_adr),hl
 		ld hl,clr_analizator
-		call set_ports_nowait		; clear video mem
+		call set_ports			; clear video mem - wait for the DMA fill to finish
+					; before the CPU draws bars into the same area below
 
 		ld hl,ay_volume
 		push hl
