@@ -106,13 +106,14 @@ do_after_load	ld a,0
 
 main_ex		call wait_frame
 
-		ld a,(music_sw+1)	; draw the volume-bar analyzer here in the foreground,
-		or a			; frame-synced but off the raster-critical interrupt chain
-		jr z,skip_analizator
+		ld a,(music_sw+1)	; music-playing UI bits (now-playing blink, volume-bar
+		or a			; analyzer) done here in the foreground, frame-synced,
+		jr z,skip_music_ui	; instead of inside the raster-critical interrupt chain
+		call show_now_play_link
 		ld a,(save_mode+1)
 		or a
 		call nz,music_analizator
-skip_analizator
+skip_music_ui
 
 do_start_music	ld a,1
 		or a
@@ -2273,8 +2274,8 @@ int_ex3		ld hl,0
 
 pt_play		call set_music_pages_lite
 		call music_player_play
-		call restore_music_pages_lite	; PAGE3 only needed for the tick itself -
-					; restore it before the (page-independent) link-blink/autoplay tail below
+		jp restore_music_pages_lite	; the link-blink/autoplay tail (show_now_play_link)
+					; is now called separately from the main loop, not from here
 
 show_now_play_link	ld a,0
 		or a
