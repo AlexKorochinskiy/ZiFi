@@ -2203,9 +2203,9 @@ txt_border	ld a,#f0
 		ld b,high VCONFIG
 		ld a,VID_TEXT+VID_320X240
 		out (c),a
-;		ld b,high TSCONFIG
-;		ld a,TSU_SEN
-;		out (c),a
+		ld b,high TSCONFIG
+		ld a,TSU_SEN
+		out (c),a
 		ld b,high VPAGE
 		ld a,Text_page
 		out (c),a
@@ -2249,7 +2249,7 @@ int_text_off	push af,hl,de,bc,ix,iy
 		push af
 		exa
 		call set_256c_mode
-		ld hl,47+240-1
+		ld hl,47+240	; was 47+240-1 - bottom panel sat a couple pixels too low
 		ld b,high GYOFFSL
 		out (c),l
 		inc b
@@ -3479,7 +3479,7 @@ status_icon_copy
 cancel_icon_copy
 		db #1a,low cancel_icon
 		db #1b,high cancel_icon
-		db #1c,2 
+		db #1c,2
 		db #1d,4+4+128
 		db #1e,#3e-2
 		db #1f,Vid_page+8
