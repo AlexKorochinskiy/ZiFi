@@ -336,6 +336,8 @@ load_ram_page	ld a,0
 
 
 zifi_get	call wait_frame
+		ld a,dl_timeout_quanta	; fresh inactivity budget for this connection attempt
+		ld (dl_timeout_left),a
 		ld a,(load_ram_page+1)
 		ld (zipd_page+1),a
 		call set_page0
@@ -545,6 +547,59 @@ wifi_cancel_download_ex
 		call set_ports
 		jp main
 
+; same hard unwind as above, but leaves load_sw alone - timeout_next_track
+; already set it to 1 so main picks up and starts loading the next track
+dl_timeout_advance_ex
+		ld sp,#bfff
+		xor a
+		ld (wifi_cancel_download+1),a
+		ld hl,status_copy		; clear statusbar gfx
+		call set_ports
+		jp main
+
+; same hard unwind again, but re-arms load_sw for the SAME target (parse_url
+; already built the request - just resend it) instead of cancelling/skipping
+dl_timeout_retry_ex
+		ld sp,#bfff
+		xor a
+		ld (wifi_cancel_download+1),a
+		ld a,1
+		ld (load_sw+1),a
+		ld hl,status_copy		; clear statusbar gfx
+		call set_ports
+		jp main
+
+dl_timeout_quanta	equ 2	; ~5s per quantum (256 frames @ 50Hz) - 2 quanta = ~10s of silence
+dl_timeout_left	db 0
+
+dl_retries_max	equ 3	; retry the same request this many times before giving up on it
+dl_retries_left	db dl_retries_max
+
+music_skip_chain_max	equ 8	; give up after this many consecutive dead tracks
+music_skip_chain_left	db music_skip_chain_max
+
+; called when a download times out while loading a music track - advances
+; autoplay_num and starts loading the next track instead of just cancelling
+timeout_next_track
+		ld a,(sum_list_lines+1)
+		dec a
+		ld c,a
+		ld a,(autoplay_num+1)
+		inc a
+		cp c
+		jr c,1f
+		ld a,1
+1		ld (autoplay_num+1),a
+		call calc_link_num
+		ld a,list_ram_page
+		call set_page1
+		ld h,(ix+4)
+		ld l,(ix+3)
+		call parse_url
+		ld a,1
+		ld (load_sw+1),a
+		ret
+
 count_ipd_lenght
 		ld hl,0			; count lenght
 ;		ld de,strbuff+7
@@ -603,7 +658,7 @@ read_pack
 1		dec hl
 		ld a,h
 		or a
-		jr z,zifi_read_ipd_ex
+		jp z,zifi_read_ipd_ex
 		in a,(c)
 		or a				; 0 - input FIFO is empty,
 		jr z,1b
@@ -718,15 +773,50 @@ zifi_input_fifo_check
 		ld e,0
 3		in a,(c)
 		or a				; 0 - input FIFO is empty,
-		ret nz
+		jr z,1f
+		push af
+		ld a,dl_timeout_quanta		; got data - reset the inactivity timeout
+		ld (dl_timeout_left),a
+		pop af
+		ret
+1
 wifi_cancel_download	ld a,0
 		or a
 		jp nz,wifi_cancel_download_ex
 		call wait_frame
 		dec e
 		jr nz,3b
+
+	; one ~5s quantum (256 frames @ 50Hz) passed with nothing from the server at all
+		ld a,(dl_timeout_left)
+		dec a
+		ld (dl_timeout_left),a
+		jr nz,error		; still have quanta left - flash the border and keep waiting
+
+	; timed out - retry the same request a few times before giving up on it
+		ld a,(dl_retries_left)
+		or a
+		jr z,dl_timeout_no_more_retries
+		dec a
+		ld (dl_retries_left),a
+		jp dl_timeout_retry_ex
+
+dl_timeout_no_more_retries
+		ld a,(do_after_load+1)
+		cp play_music
+		jr nz,dl_timeout_giveup
+		ld a,(music_skip_chain_left)
+		or a
+		jr z,dl_timeout_giveup	; skipped too many dead tracks in a row - stop trying
+		dec a
+		ld (music_skip_chain_left),a
+		call timeout_next_track
+		jp dl_timeout_advance_ex
+dl_timeout_giveup
+		jp wifi_cancel_download_ex
+
 error		ld a,2
-		out (#fe),a		
+		out (#fe),a
 		ret
 
 clear_output_fifo	ld a,cmd_clear_output_fifo
@@ -1382,6 +1472,8 @@ td1		exa
 ;	http://zxaaa.untergrund.net/get.php?f=DEMO6/a_brief_history_of_vacuum_cleaner_nozzle_attachments.zip
 
 parse_url
+		ld a,dl_retries_max	; a fresh target - reset the retry budget
+		ld (dl_retries_left),a
 	; detect http:// vs https:// (5th char: ':' for http, 's'/'S' for https)
 		push hl
 		ld bc,4
@@ -2800,6 +2892,8 @@ current_paging_page
 
 music_loaded	ld a,1
 		ld (music_play+1),a
+		ld a,music_skip_chain_max	; a track made it through - reset the dead-track counter
+		ld (music_skip_chain_left),a
 		xor a
 		ld (is_music_play+1),a
 		ld hl,(ix+thread.adress)
