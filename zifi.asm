@@ -2203,9 +2203,9 @@ txt_border	ld a,#f0
 		ld b,high VCONFIG
 		ld a,VID_TEXT+VID_320X240
 		out (c),a
-		ld b,high TSCONFIG
-		ld a,TSU_SEN
-		out (c),a
+;		ld b,high TSCONFIG
+;		ld a,TSU_SEN
+;		out (c),a
 		ld b,high VPAGE
 		ld a,Text_page
 		out (c),a
