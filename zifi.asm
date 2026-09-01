@@ -157,17 +157,18 @@ create_filename			; and check extension for scl scr sxg others
 		dec hl
 		jr 1b
 1
-		inc hl		
+		inc hl
 		ld de,FILE_NAME		; file_name create
+		ld b,48			; FILE_NAME is exactly 48 bytes - never write past it
 2		ld a,(hl)
 		cp ' '
 		jr z,1f
 		ld (de),a
 		inc hl
 		inc de
-		jr 2b
+		djnz 2b			; ran out of room - stop here and null-terminate below
 
-1		
+1
 		xor a
 		ld (de),a
 
