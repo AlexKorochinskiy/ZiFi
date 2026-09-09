@@ -3938,8 +3938,9 @@ lv512_advance	ld hl,(lv512_off)
 		ld a,h
 		cp #80
 		jr c,lv512_nowrap
-		ld hl,#4000
-		ld a,(lv512_page)
+		sub #40			; preserve the overflow remainder instead
+		ld h,a			; of resetting to exactly #4000 -- see
+		ld a,(lv512_page)	; sv512_advance's own comment below
 		inc a
 		ld (lv512_page),a
 lv512_nowrap	ld (lv512_off),hl
@@ -3960,14 +3961,32 @@ lv512_eoc	ld a,(lv512_page)
 ;--- sv512_advance: sv512_off += 512, wrapping to sv512_page+1 (back to
 ;--- slot-1 offset 0x4000, NOT 0 -- see header comment on the real
 ;--- 0x4000-0x7FFF convention) once it would leave the 0x4000-0x7FFF
-;--- range, i.e. reach 0x8000 (one page = exactly 32 blocks). ---
+;--- range, i.e. reach 0x8000 (one page = exactly 32 blocks).
+;---
+;--- The wrap subtracts #40 from H (preserving whatever this add
+;--- overshot #8000 by) instead of hardcoding H:=#40 -- CP doesn't
+;--- touch A, so A still holds the pre-wrap H here, free to reuse.
+;--- create_filename's ".EXT"-marker handling can start thread.adress
+;--- (and so sv512_off, on the very first call) a few bytes PAST
+;--- #4000 (skipping a leading ".TRD"/".SCL"/etc marker some servers
+;--- prepend to the real payload) -- a hardcoded reset to exactly
+;--- #4000 silently drops that remainder on the FIRST page wrap only
+;--- (every wrap after that starts page-aligned, so the bug is
+;--- invisible again), splicing 4 stray bytes from the tail of the
+;--- block just written into the next one and losing the file's real
+;--- last 4 bytes. Confirmed via a live memory-vs-disk diff on a real
+;--- multi-page download (2026-09-09): RAM was correct throughout,
+;--- only the on-disk copy had the extra bytes -- see
+;--- [[project-zifi-custom-sd-driver]]. Same fix applied to
+;--- lv512_advance above (LOAD512's own copy of this logic). ---
 sv512_advance	ld hl,(sv512_off)
 		ld de,512
 		add hl,de
 		ld a,h
 		cp #80
 		jr c,sv512_nowrap
-		ld hl,#4000
+		sub #40
+		ld h,a
 		ld a,(sv512_page)
 		inc a
 		ld (sv512_page),a
