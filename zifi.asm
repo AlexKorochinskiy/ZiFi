@@ -281,14 +281,19 @@ load_ram_page	ld a,0
 		ex de,hl			; download adress for lists. after "Search:"
 1		ld (zipd_adr+1),hl
 
-	IF cable_zifi 
+; snapshot load_ram_page NOW, before the (possibly multi-second)
+; network receive below -- see saved_thread_page's own comment for why
+; re-reading load_ram_page AFTER the call is wrong.
+		ld a,(load_ram_page+1)
+		ld (saved_thread_page),a
+
+	IF cable_zifi
 		ld a,(load_ram_page+1)
 		ld hl,modem_command
 		call psb_get
 	ELSE
 		call zifi_get
 	ENDIF
-
 
 ; bc: hl - lenght of readed data
 		ld ix,read_threads
@@ -303,7 +308,7 @@ load_ram_page	ld a,0
 
 1		xor a
 		ld (ix+thread.num),a
-		ld a,(load_ram_page+1)
+		ld a,(saved_thread_page)
 		ld (ix+thread.page),a
 		call set_page1
 		ld hl,status_copy		; clear statusbar gfx
@@ -3824,13 +3829,47 @@ sd_init
 */
 
 
+; on_int_dma/off_int_dma bracket EVERY SD operation (init_sd_card at
+; the start, sd_exit at the end -- see their own call sites) -- but
+; save_mode alone doesn't cover everything: int_main's pt_play (~line
+; 2350) is gated by its OWN SEPARATE music_sw flag, not save_mode, and
+; unconditionally repages PAGE0/PAGE1/PAGE3 for the music player
+; (set_music_pages_lite) on every single interrupt a track is playing.
+; PAGE0 changing mid-execution while our SD driver code is running
+; FROM slot 0 (page #0F) crashes the instant the interrupt returns;
+; PAGE3 changing mid-LOAD512/SAVE512 silently swaps the transfer's
+; real source/dest for whatever the music player last pointed it at.
+; wrap_load512/wrap_save512's own di/ei (zc_sd_driver.asm) only
+; protects against the CRASH by blocking ALL interrupts for the whole
+; multi-block transfer -- but that STARVES pt_play for however long
+; the transfer takes (can be several video frames for a large file),
+; which is exactly why music glitches/goes to noise and the screen
+; flickers when switching tracks during any SD activity: pt_play
+; simply never gets to run its own per-frame update while we're mid-
+; transfer, then resumes abruptly once di/ei lets it back in. Clearing
+; music_sw here too (not just save_mode) means pt_play's own "call
+; nz,pt_play" check skips it ENTIRELY during SD operations -- a clean
+; pause instead of a starve-then-jump-back-in glitch -- confirmed as
+; the real cause of "noise mixed with melody" persisting even after
+; the SAVE512 addressing fix (which was a real, separate bug, but not
+; the only one). See [[project-zifi-custom-sd-driver]].
+; music_sw_saved: off_int_dma saves music_sw's real value here (which
+; may already be 0 if the user paused music) before forcing it off, so
+; on_int_dma can RESTORE that instead of blindly forcing it back to 1
+; -- otherwise an SD operation happening while music is paused would
+; incorrectly un-pause it.
+music_sw_saved	db 0
+
 on_int_dma	ld a,1
-		jr sw_int_dma
-off_int_dma	xor a
-sw_int_dma	ld (save_mode+1),a
-	;	ld (analizator_sw+1),a
-;		ld (mouse_sw+1),a
-;		jp wait_frame
+		ld (save_mode+1),a
+		ld a,(music_sw_saved)
+		ld (music_sw+1),a
+		ret
+off_int_dma	ld a,(music_sw+1)
+		ld (music_sw_saved),a
+		xor a
+		ld (save_mode+1),a
+		ld (music_sw+1),a
 		ret
 
 
@@ -3968,7 +4007,11 @@ load_ini
 		CALL FENTRY
 		JP Z,ini_not_found
 		LD C,download_page	; page ini
-		LD HL,#0000
+		LD HL,#4000		; LOAD512 uses the SAME slot-1/direct-
+					; address convention as SAVE512 -- see
+					; zc_sd_driver_body.asm's core_load512
+					; comment for why this changed from
+					; #0000/PAGE3
 		LD B,#32
 		CALL LOAD512
 		CALL SETROOT; возвращаемся в коневой
@@ -3976,8 +4019,8 @@ load_ini
 
 
 parse_ini	ld a,download_page
-		call set_page3
-		ld hl,#c000
+		call set_page1
+		ld hl,#4000
 	IF !cable_zifi 
 		ld de,ini_db
 		call cp_ini
@@ -4691,6 +4734,27 @@ full_len_high	byte	;
 read_threads	thread;ds 6*5
 		db #ff
 
+; modem_load_file's own private snapshot of load_ram_page, captured
+; right before starting the actual network receive (zifi_get/psb_get)
+; -- NOT the same as re-reading load_ram_page after the call returns.
+; load_ram_page is a single shared global, written from several other
+; places (catalog-link clicks, pagination, menu navigation -- see
+; loadpage_after_link_list and the download_page writers). zifi_get can
+; run for several seconds (WiFi connect/TLS handshake/HTTP wait, many
+; wait_frame-yielded interrupt frames), during which the interrupt-
+; driven UI can process a DIFFERENT click that overwrites load_ram_page
+; before zifi_get returns. Re-reading load_ram_page at that point (the
+; old code) stamps thread.page with whatever category was clicked LAST,
+; not the one this download actually used. This is a real, still-latent
+; hazard (kept as a defensive fix), but turned out NOT to be the cause
+; of "every download saves as identical garbage" -- that bug was a
+; stale IX left behind by MKFILE (see the wrap_* comment in
+; zc_sd_driver.asm), which made save_64 read (ix+thread.page)/(ix+
+; thread.adress) from the wrong memory entirely, regardless of what
+; read_threads itself held. See [[project-zifi-custom-sd-driver]]
+; (2026-09-09).
+saved_thread_page	db 0
+
 
 
 init_zifi
@@ -4722,17 +4786,80 @@ init_zifi
 ;		call wait
 ;		call zifi_check_receive_command
 ;	ret
+		ld a,wifi_connect_retries_max
+		ld (wifi_connect_retries_left),a
+
+; wifi_connect_retry: (re)send AT+CWJAP_CUR and wait for "OK" -- up to
+; wifi_connect_quanta quanta (~256 frames/quantum, ~5s each) per
+; attempt, up to wifi_connect_retries_max attempts total. Was an
+; unconditional "jr nz,2b" with NO timeout at all -- a real ESP module
+; that never answers (bad credentials, out of range, module wedged)
+; hung here forever with zero feedback. See [[project-zifi-custom-sd-driver]].
+wifi_connect_retry
         	ld hl,wifi_try_connect
         	ld b,2
 		call zifi_echo
 		ld hl,cmd_cwjap	; AT+CWJAP_CUR . Connect to AP, for current
 		call zifi_send
 
-2		call zifi_check_receive_command
+		ld a,wifi_connect_quanta
+		ld (wifi_connect_quantum_left),a
+
+wifi_connect_quantum
+		xor a
+		ld (wifi_connect_frame_left),a	; 0 wraps to 256 via dec below
+
+wifi_connect_poll
+		; NOT "call zifi_check_receive_command" -- that goes through
+		; zifi_input_fifo_check, which BLOCKS INTERNALLY for up to
+		; 256 frames (its own "call wait_frame / dec e / jr nz,3b")
+		; whenever the FIFO is empty, only returning immediately
+		; when data IS already waiting. With nothing new arriving,
+		; nearly every call to it here would burn a full internal
+		; 256-frame wait BEFORE this loop's own frame counter even
+		; gets to react -- confirmed live (wifi_connect_frame_left
+		; stayed frozen for 6500+ frames: this loop's "iterations"
+		; were each secretly taking up to 256 frames on their own).
+		; It also drives zifi_input_fifo_check's OWN separate
+		; download-timeout/retry state (dl_timeout_left etc, meant
+		; for actual file downloads, not this WiFi-connect wait) --
+		; that's what caused the red border flashes. Doing our own
+		; quick, non-blocking FIFO peek here avoids both problems:
+		; only call the (bulk-read) fifo_inir when data is actually
+		; present, so it never falls into the internal wait either.
+		ld bc,zifi_input_fifo_status
+		in a,(c)
+		or a
+		jr z,wifi_connect_nodata
+		call fifo_inir
 		ld de,str_ok
         	call buffer_cmp
-;        	cp low output_buff+#bf
-        	jr nz,2b
+        	jr z,wifi_connect_ok
+wifi_connect_nodata
+		call wait_frame
+		ld hl,wifi_connect_frame_left
+		dec (hl)
+		jr nz,wifi_connect_poll
+
+		ld a,(wifi_connect_quantum_left)
+		dec a
+		ld (wifi_connect_quantum_left),a
+		jr nz,wifi_connect_quantum
+
+		; this attempt's quanta are exhausted -- retry if any left
+		ld a,(wifi_connect_retries_left)
+		dec a
+		ld (wifi_connect_retries_left),a
+		jr nz,wifi_connect_retry
+
+		; out of retries -- give up with a real message instead of
+		; hanging silently forever
+		ld hl,wifi_connect_failed_msg
+		ld b,1
+		call zifi_echo
+		jr $
+
+wifi_connect_ok
         	ld hl,wifi_connected
 		call zifi_echo
 		ld a,(update_rtc_sw+1)	; "time:" in zifi.ini not "none"?
@@ -4741,6 +4868,13 @@ init_zifi
 		call rtc_read_date	; name downloads/<date> from the RTC chip either way
 		call set_download_dir
 		ret
+
+wifi_connect_quanta		equ 4	; ~5s/quantum * 4 = ~20s per attempt
+wifi_connect_retries_max	equ 5
+wifi_connect_frame_left	db 0
+wifi_connect_quantum_left	db 0
+wifi_connect_retries_left	db 0
+wifi_connect_failed_msg	db #0d,#0a,'WiFi connect failed',0,0
 ;		ld b,25
 ;		call wait
 ;		ld hl,cmd_cipsta	; is Set IP address of station ?
