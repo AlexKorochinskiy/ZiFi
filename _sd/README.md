@@ -71,8 +71,17 @@ CPU.
 ```
 cd _sd
 sjasmplus.exe zc_sd_driver_body.asm --sym=body_syms_new.txt
-# упаковать zc_sd_driver_body.bin -> zc_sd_driver_body.pb (PackBits)
-# обновить body_syms.inc из body_syms_new.txt (без DATA/CONF)
+
+# зачем: --sym выгружает адреса ВСЕХ меток тела (включая DATA/CONF --
+# служебные метки портов ввода-вывода), а zc_sd_driver.asm уже сам
+# объявляет DATA/CONF как константы -- если подключить дамп как есть,
+# получим "Duplicate label: DATA"/"Duplicate label: CONF". Поэтому
+# перед тем как класть файл в body_syms.inc, эти две строки убираются:
+grep -v -E "^(DATA|CONF): EQU" body_syms_new.txt > body_syms.inc
+
+# упаковать zc_sd_driver_body.bin -> zc_sd_driver_body.pb (PackBits;
+# любым PackBits-кодировщиком с раунд-трип проверкой -- контрольный
+# байт C: C=128 конец, C<128 литерал C+1 байт, C>128 повтор (257-C) раз)
 sjasmplus.exe zc_sd_driver.asm
 ```
 
