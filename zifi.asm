@@ -91,6 +91,8 @@ start
 		ld hl,zifi_ready_msg
 		ld b,1
 		call zifi_echo
+		ld a,1
+		ld (zifi_ready),a	; enable menu tabs only after all initialization above
 		ld a,(mouse_button)
 		cpl
 		and #f0
@@ -2992,7 +2994,11 @@ pause_music1	xor a
 		call restore_music_pages
 		jp lmb_ex
 
-menu_click	srl a
+menu_click	ld a,(zifi_ready)
+		or a
+		jp z,lmb_ex		; Wi-Fi/NTP/download directory initialization still running
+		ld a,(mouse_y)
+		srl a
 		srl a
 		srl a
 		srl a
@@ -3688,6 +3694,7 @@ text_down_copy	db #1a,0	;low #c000+window_height*2*256
 		include "tsconfig.asm"
 
 mouse_button	db 0
+zifi_ready	db 0
 /*
   D0 - левая кнопка
   D1 - правая кнопка
@@ -4239,7 +4246,19 @@ str_epoch_year	db "1970"
 sntp_outer_left	db 0
 month_names	db "JanFebMarAprMayJunJulAugSepOctNovDec"
 
-ntp_sync_rtc	call clear_input_fifo	; drop stale bytes before reading the reply
+; Five bounded attempts.  On final failure CF=1; caller deliberately falls
+; back to rtc_read_date so downloads still work with no network time.
+ntp_sync_rtc	ld b,5
+.retry		push bc
+		call ntp_sync_rtc_once
+		pop bc
+		ret nc
+		djnz .retry
+		scf
+		ret
+
+ntp_sync_rtc_once
+		call clear_input_fifo	; drop stale bytes before reading the reply
 		ld hl,cmd_sntp_cfg
 		call zifi_send
 		ld b,15			; bounded wait for CIPSNTPCFG's own OK
@@ -4248,6 +4267,7 @@ sntp_cfg_wait	ld de,str_ok
 		jr z,sntp_cfg_ok
 		call fifo_inir
 		djnz sntp_cfg_wait
+		scf
 		ret			; module didn't even accept the config - give up
 sntp_cfg_ok
 		ld a,15
@@ -4262,6 +4282,7 @@ sntp_query_wait	ld de,str_sntp_time
 		jr z,sntp_have_line
 		call fifo_inir
 		djnz sntp_query_wait
+		scf
 		ret			; module never answered the query at all - give up
 
 sntp_have_line			; hl -> start of "Www Mmm dd hh:mm:ss yyyy" (buffer_cmp leaves it there)
@@ -4284,7 +4305,8 @@ sntp_epoch_chk	ld a,(de)
 		ld b,50			; ~1s before asking again
 		call wait
 		jr sntp_query
-sntp_no_sync	ret			; gave up - boot continues without RTC sync
+sntp_no_sync	scf
+		ret			; this attempt exhausted its bounded epoch wait
 
 sntp_real_time	pop hl			; hl -> string start, this is a real time now
 
@@ -4453,6 +4475,7 @@ gmt_time	add 0
 		ld hl,ntp_synced_msg
 		ld b,1
 		call zifi_echo
+		xor a			; NC = NTP date was written to RTC
 		ret
 
 ; in: ix -> 3-letter month name (e.g. from CIPSNTPTIME's reply)
