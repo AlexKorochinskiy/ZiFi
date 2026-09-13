@@ -10,6 +10,11 @@ Vid_page		equ #e0
 Sprite_page		equ #f0
 Mouse_pal_num		equ #f0
 
+; BORDER is sampled immediately by the FPGA, unlike VCONFIG/VPAGE which are
+; latched at the following line start.  Keep one palette index for the whole
+; frame: #00 is black in both the 256c palette and text GPAL (#F0).
+GFX_BORDER		equ #00
+
 sd_driver_page		equ #0f
 cursor_adr		equ #c000
 cursor_page		equ #10	
@@ -52,15 +57,30 @@ start
 //		call write_rtc
 		ld sp,#bfff
 		call all_init
- 		call set_256c_mode		
+		call set_256c_mode
+		; TSCONFIG (sprite engine) and PALSEL set EXACTLY ONCE, here --
+		; see set_256c_mode's comment. #3f = GPAL=15/T0PAL=3/T1PAL=0;
+		; confirmed by the sibling fork's own author: writing PALSEL
+		; mid-frame (from the raster interrupt handlers, every mode
+		; switch) is the actual root cause of the cursor-cutoff bug.
+		ld bc,TSCONFIG
+		ld a,TSU_SEN
+		out (c),a
+		ld bc,PALSEL
+		ld a,#3f
+		out (c),a
 		call sd_init
 		ei
  		ld b,60
  		call wait
- 		ld hl,int_main
-		ld (#beff),hl
- 		call gfx_init
+		; Do not expose the raster handler before Text_page has been cleared:
+		; otherwise a frame can display the loader's leftover RAM contents.
+		di
+		call gfx_init
 		call set_text_colors
+		ld hl,int_main
+		ld (#beff),hl
+		ei
 		call load_ini
 	IF cable_zifi
 		call psb_start
@@ -106,14 +126,12 @@ do_after_load	ld a,0
 
 main_ex		call wait_frame
 
-		ld a,(music_sw+1)	; music-playing UI bits (now-playing blink, volume-bar
-		or a			; analyzer) done here in the foreground, frame-synced,
-		jr z,skip_music_ui	; instead of inside the raster-critical interrupt chain
-		call show_now_play_link
+		; The analyzer runs outside the raster IRQ: its variable-height bars are
+		; too long for the line-287 handler.  analyzer_active makes pt_play
+		; restore PAGE3 back to this routine if an IRQ occurs meanwhile.
 		ld a,(save_mode+1)
 		or a
 		call nz,music_analizator
-skip_music_ui
 
 do_start_music	ld a,1
 		or a
@@ -2217,7 +2235,9 @@ int_gfx_view	push af,hl,de,bc,ix
 		ret
 
 int_main	push af,hl,de,bc,ix,iy
-		ld a,#34
+		; Line 0 is in vertical blanking.  Restore the single black border here,
+		; never during the text/graphics transition lines.
+		ld a,GFX_BORDER
 		ld bc,BORDER
 		out (c),a
 		exx
@@ -2236,24 +2256,37 @@ frame		ld a,0
 		inc a
 		ld (frame+1),a
 
+		; Arm the text-mode raster chain before potentially long mouse/list
+		; processing.  A CPU screen copy can take longer than the 84 raster lines
+		; before the text area; delaying this setup exposes the 256c page for one
+		; frame.
+		ld hl,56+4*8-4
+		ld bc,VSINTL
+		out (c),l
+		ld b,high VSINTH
+		out (c),h
+		ld hl,int_text_cor
+		ld (#beff),hl
+		ei
+
 save_mode	ld a,1
 		or a
-		jr z,int_ex2
+		jr z,int_ex_regs
 mouse_sw	ld a,1
 		or a
 		call nz,mouse_proc
 link_highlight	ld a,0
 		or a
 		call nz,link_highlight_view
+		jr int_ex_regs
 
-int_ex2		ld hl,56+4*8-4
-		ld de,int_text_cor
 int_ex		ld bc,VSINTL
 		out (c),l
 		ld b,high VSINTH
 		out (c),h
 		ex de,hl
 		ld (#beff),hl
+int_ex_regs
 		exa
 		pop af
 		exa
@@ -2285,32 +2318,27 @@ int_text_cor_ex	ld a,0
 		pop af
 		ret
 
-int_text_on	push af,hl,de,bc,ix,iy
-txt_border	ld a,#f0
-		ld bc,BORDER
+int_text_on	push af,hl,de,bc
+		; VCONFIG, VPAGE and GYOFFS are latched on the next line start;
+		; program them first.  BORDER is intentionally not touched here.
+		ld a,(click_offset+1)
+		ld bc,GYOFFSL
 		out (c),a
+		ld b,high VCONFIG
+		ld a,VID_TEXT+VID_320X240
+		out (c),a
+		ld b,high VPAGE
+		ld a,Text_page
+		out (c),a
+		ld a,#3f
+		ld (int_text_cor_ex+1),a
+		push ix,iy
 		exx
 		push hl,de,bc
 		exx
 		exa
 		push af
 		exa
-		ld a,(click_offset+1)
-		ld b,high GYOFFSL
-		out (c),a
-		ld b,high VCONFIG
-		ld a,VID_TEXT+VID_320X240
-		out (c),a
-;		ld b,high TSCONFIG
-;		ld a,TSU_SEN
-;		out (c),a
-		ld b,high VPAGE
-		ld a,Text_page
-		out (c),a
-		ld b,high PALSEL
-		ld a,#3f
-		out (c),a
-		ld (int_text_cor_ex+1),a
 		ld hl,47+240-1-2
 		ld de,int_text_ofcor
 		jp int_ex
@@ -2336,22 +2364,22 @@ int_text_ofcor_ex	ld a,0
 		pop af
 		ret
 
-int_text_off	push af,hl,de,bc,ix,iy
-		ld a,#34
-		ld bc,BORDER
-		out (c),a
-		exx
-		push hl,de,bc
-		exx
-		exa
-		push af
-		exa
+int_text_off	push af,hl,de,bc
+		; The mode registers are latched on the next line start.  BORDER is
+		; deliberately unchanged here: it must stay constant over the frame.
 		call set_256c_mode
 		ld hl,47+240	; was 47+240-1 - bottom panel sat a couple pixels too low
 		ld b,high GYOFFSL
 		out (c),l
 		inc b
 		out (c),h
+		push ix,iy
+		exx
+		push hl,de,bc
+		exx
+		exa
+		push af
+		exa
 music_sw	ld a,0
 		or a
 		call nz,pt_play
@@ -2359,7 +2387,6 @@ music_sw	ld a,0
 		ld a,(save_mode+1)
 		or a
 		jr z,int_ex3
-
 enter_search_sw	ld a,0
 		or a
 		call nz,enter_search
@@ -2372,8 +2399,14 @@ int_ex3		ld hl,0
 
 pt_play		call set_music_pages_lite
 		call music_player_play
-		jp restore_music_pages_lite	; the link-blink/autoplay tail (show_now_play_link)
-					; is now called separately from the main loop, not from here
+		jp show_now_play_link
+pt_play_restore_pages
+		call restore_music_pages_lite
+		ld a,(analyzer_active)
+		or a
+		ret z
+		ld a,Vid_page+9
+		jp set_page3_lite
 
 show_now_play_link	ld a,0
 		or a
@@ -2432,7 +2465,7 @@ autoplay_num	ld a,0
 		call parse_url
 		ld a,1
 		ld (load_sw+1),a
-pt_play_ex	jp restore_music_pages_lite	; autoplay may have re-pointed page1 itself above - restore again
+pt_play_ex	jp pt_play_restore_pages	; autoplay may have re-pointed page1 itself above - restore again
 /*
 SETUP	DB 0 ;set bit0, if you want to play without looping
 	     ;(optional);
@@ -2456,12 +2489,14 @@ set_256c_mode
 		ld b,high VPAGE
 		ld a,Vid_page
 		out (c),a
-		ld b,high PALSEL
-		xor a
-		out (c),a
-		ld b,high TSCONFIG
-		ld a,TSU_SEN
-		out (c),a
+		; TSCONFIG and PALSEL NOT touched here -- both written exactly
+		; once at program start instead (see "start"). This procedure
+		; runs from the raster interrupt handlers (int_main,
+		; int_text_off) every single frame; the sibling fork's own
+		; author confirmed writing PALSEL mid-frame is the real cause
+		; of the cursor-cutoff bug (TSCONFIG has the same hazard:
+		; re-asserting the sprite engine mid-scanline blanks the
+		; cursor sprite on that line).
 		ret
 
 link_highlight_view
@@ -2485,14 +2520,15 @@ link_highlight_view
 		jp restore_page3
 
 music_analizator
+		ld a,1
+		ld (analyzer_active),a
 		ld a,Vid_page+9
 		call set_page3_lite
 
 		ld hl,0
 		ld (analizator_screen_adr),hl
 		ld hl,clr_analizator
-		call set_ports			; clear video mem - wait for the DMA fill to finish
-					; before the CPU draws bars into the same area below
+		call set_ports			; wait for the fill before drawing over it
 
 		ld hl,ay_volume
 		push hl
@@ -2535,8 +2571,11 @@ ma2		ld (hl),a
 		inc h
 		dec c
 		jr nz,ma3
+		xor a
+		ld (analyzer_active),a
 		jp restore_page3
 ay_volume	ds 3
+analyzer_active	db 0
 
 
 
@@ -3420,7 +3459,7 @@ gfx_init	ld hl,cursor_copy
 		ret
 
 init_ts		db #20,6
-		db high BORDER,#f0	; border
+		db high BORDER,GFX_BORDER	; border
 		db high SGPAGE, Sprite_page
 		db high CacheConfig,#0c	; cache for #8000 - #c000
 
