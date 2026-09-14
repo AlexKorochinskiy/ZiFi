@@ -216,59 +216,46 @@ wrap_save512	push ix
 		call core_save512
 		pop ix
 		ret
-wrap_mkfile	di
-		push ix
+; Runtime filesystem calls are already bracketed by zifi.asm's
+; init_sd_card/sd_exit.  That disables every IRQ job which can repage CPU
+; slots or touch DMA, while leaving the raster interrupts themselves alive.
+; Keeping DI across FAT scans and card busy waits skipped the text-mode raster
+; lines and produced full-height bands / flashes of the backing splash.
+wrap_mkfile	push ix
 		call core_mkfile
 		pop ix
-		ei
 		ret
-wrap_mkdir	di
-		push ix
+wrap_mkdir	push ix
 		call core_mkdir
 		pop ix
-		ei
 		ret
-wrap_fentry	di
-		push ix
+wrap_fentry	push ix
 		call drv_fentry
 		pop ix
-		ei
 		ret
-wrap_loadnon	di
-		push ix
+wrap_loadnon	push ix
 		call drv_loadnon
 		pop ix
-		ei
 		ret
-wrap_setdir	di
-		push ix
+wrap_setdir	push ix
 		call core_setdir
 		pop ix
-		ei
 		ret
-wrap_setroot	di
-		push ix
+wrap_setroot	push ix
 		call core_setroot
 		pop ix
-		ei
 		ret
-wrap_seek0	di
-		push ix
+wrap_seek0	push ix
 		call stream_open
 		pop ix
-		ei
 		ret
-wrap_delfl	di
-		push ix
+wrap_delfl	push ix
 		call core_delfl
 		pop ix
-		ei
 		ret
-wrap_renam	di
-		push ix
+wrap_renam	push ix
 		call core_renam
 		pop ix
-		ei
 		ret
 ; DOS_SWP now does real work (depacking the body -- see drv_dos_swp
 ; below), unlike every other entry here it previously had NO di/ei

@@ -273,13 +273,19 @@ rfilp4		ld bc,0
 		ret
 	ENDIF
 	IFUSED set_ports
-set_ports	ld c,#AF
+set_ports	ld a,1
+		ld (dma_busy),a
+		ld c,#AF
 .m1		ld b,(hl) 
 		inc hl
 		inc b
-		jr z,dma_stats
+		jr z,.wait
 		outi
 		jr .m1
+.wait		call dma_stats
+		xor a
+		ld (dma_busy),a
+		ret
 	ENDIF
 	
 	IFUSED set_ports_nowait

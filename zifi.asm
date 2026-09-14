@@ -372,28 +372,28 @@ zifi_get	call wait_frame
 		ld hl,0
 		ld (readed_len_low+1),hl
 		ld hl,cmd_conn2site	; AT+CIPSTART	- connect to site
-		call zifi_send
+		call zifi_send_raw	; response is polled below; do not enter fifo_inir's hidden wait
 
 		ld de,str_error
 		call buffer_cmp
 		jr nz,zg_ok
 
 		ld hl,cmd_cipclose
-		call zifi_send
+		call zifi_send_raw
 1		ld de,str_ok
 		call buffer_cmp
 		jr z,zifi_get
+		call poll_input_fifo
 		call wait_frame
-		call fifo_inir
 		jr 1b
 
-zg_ok		ld b,15		; TLS handshakes (SSL connect) can take longer than one poll
+zg_ok		ld b,250		; up to ~5s for a TLS connect reply, without a hidden FIFO wait
 zg_ok_wait	ld de,str_ok
-        	call buffer_cmp
+		call buffer_cmp
 		jr z,zg_ok_done
 		push bc
+		call poll_input_fifo
 		call wait_frame
-		call fifo_inir
 		pop bc
 		djnz zg_ok_wait
 		jr zifi_get	; still no OK - start the whole connection attempt over
@@ -401,10 +401,12 @@ zg_ok_done
 
 1		ld hl,cmd_cipsend	; AT+CIPSEND=<link ID>,<length>
 		call zifi_send_raw
-2		call fifo_inir
+2		call poll_input_fifo
 		ld de,str_ok
         	call buffer_cmp
-        	jr nz,2b
+		jr z,1f
+		call wait_frame
+		jr 2b
 1		ld a,(hl)
 		inc hl
 		cp #ff
@@ -711,6 +713,19 @@ read_pack_proc	cp 0xbf
 ;		inir
 ;		ei
 ;		push af
+		ret
+
+; Read pending ESP bytes only when FIFO already contains data.  fifo_inir
+; otherwise calls zifi_input_fifo_check, which may wait 256 frames and used to
+; let the start-up splash show through while an NTP server was silent.
+; BC is preserved because callers can use it as a retry counter.
+poll_input_fifo	push bc
+		ld bc,zifi_input_fifo_status
+		in a,(c)
+		or a
+		jr z,.done
+		call fifo_inir
+.done		pop bc
 		ret
 
 fifo_inir	push de
@@ -2274,6 +2289,12 @@ frame		ld a,0
 save_mode	ld a,1
 		or a
 		jr z,int_ex_regs
+		; Foreground screen updates and the SD driver share the single TS-Conf
+		; DMA register set with mouse sprite uploads.  Never interrupt a DMA
+		; programming sequence with another one.
+		ld a,(dma_busy)
+		or a
+		jr nz,int_ex_regs
 mouse_sw	ld a,1
 		or a
 		call nz,mouse_proc
@@ -2578,6 +2599,7 @@ ma2		ld (hl),a
 		jp restore_page3
 ay_volume	ds 3
 analyzer_active	db 0
+dma_busy	db 0
 
 
 
@@ -3434,7 +3456,12 @@ all_init	di
 		ld hl,splash_copy
 		jp set_ports
 
-gfx_init	ld hl,cursor_copy
+gfx_init	; The splash is useful only during the initial delay.  Clear its
+		; backing 256-colour pages before installing the normal UI, so a late
+		; or missed text raster can reveal only black, never the old banner.
+		ld hl,clr_gfx256_screen
+		call set_ports
+		ld hl,cursor_copy
 		call set_ports
 		ld hl,menu_copy
 		call set_ports
@@ -4244,6 +4271,7 @@ cmd_sntp_time	db "AT+CIPSNTPTIME?",13,10,0
 str_sntp_time	db "+CIPSNTPTIME:",0
 str_epoch_year	db "1970"
 sntp_outer_left	db 0
+sntp_reply_left	db 0
 month_names	db "JanFebMarAprMayJunJulAugSepOctNovDec"
 
 ; Five bounded attempts.  On final failure CF=1; caller deliberately falls
@@ -4260,13 +4288,17 @@ ntp_sync_rtc	ld b,5
 ntp_sync_rtc_once
 		call clear_input_fifo	; drop stale bytes before reading the reply
 		ld hl,cmd_sntp_cfg
-		call zifi_send
-		ld b,15			; bounded wait for CIPSNTPCFG's own OK
+		call zifi_send_raw	; the bounded loop below owns reception
+		ld a,50			; one-second, frame-based timeout for CIPSNTPCFG's OK
+		ld (sntp_reply_left),a
 sntp_cfg_wait	ld de,str_ok
 		call buffer_cmp
 		jr z,sntp_cfg_ok
-		call fifo_inir
-		djnz sntp_cfg_wait
+		call poll_input_fifo	; never call the blocking FIFO waiter while NTP is silent
+		call wait_frame
+		ld hl,sntp_reply_left
+		dec (hl)
+		jr nz,sntp_cfg_wait
 		scf
 		ret			; module didn't even accept the config - give up
 sntp_cfg_ok
@@ -4275,13 +4307,17 @@ sntp_cfg_ok
 
 sntp_query	call clear_input_fifo	; give the background sync a bit of real time each round
 		ld hl,cmd_sntp_time
-		call zifi_send
-		ld b,15			; bounded wait for THIS query's reply to arrive
+		call zifi_send_raw
+		ld a,50			; one-second, frame-based timeout for THIS reply
+		ld (sntp_reply_left),a
 sntp_query_wait	ld de,str_sntp_time
 		call buffer_cmp
 		jr z,sntp_have_line
-		call fifo_inir
-		djnz sntp_query_wait
+		call poll_input_fifo
+		call wait_frame
+		ld hl,sntp_reply_left
+		dec (hl)
+		jr nz,sntp_query_wait
 		scf
 		ret			; module never answered the query at all - give up
 
@@ -4309,47 +4345,37 @@ sntp_no_sync	scf
 		ret			; this attempt exhausted its bounded epoch wait
 
 sntp_real_time	pop hl			; hl -> string start, this is a real time now
-
-		di			; keep CMOS unlock/select/write atomic vs the raster ISR
-		ld bc,#eff7		; #EFF7 is a SHARED system register (video mode/turbo/
-		in a,(c)		; cache/memlock bits, not just the CMOS-enable bit) -
-		or #80			; must read-modify-write it, not stomp it with a literal value
-		out (c),a
+		push hl
+		call sntp_validate_reply
+		pop hl
+		jr nc,.valid
+		scf			; malformed reply: leave RTC untouched, let outer 5-attempt loop retry
+		ret
+.valid
 
 	; register b
-		ld a,#0b
-		ld b,#df
-		out (c),a
-		ld a,#82
-		ld b,#bf
-		out (c),a
+		ld d,#0b
+		ld e,#82
+		call rtc_write_reg
 
 	; day of week (3-letter name, offset 0..2), 0=Sunday
 		push hl
 		push hl
 		pop ix
-		push bc
 		call day_of_week_index	; -> a = 0-6, 0=Sunday
-		pop bc
 		pop hl
-		push af
-		ld a,#06
-		ld b,#df
-		out (c),a
-		ld b,#bf
-		pop af
-		out (c),a
+		ld d,#06
+		ld e,a
+		call rtc_write_reg
 
 	; year (last 2 of the 4 digits, offset 20..23)
 		push hl
 		ld de,22
 		add hl,de
-		ld a,#09
-		ld b,#df
-		out (c),a
-		ld b,#bf
 		call code_time_rtc
-		out (c),a
+		ld d,#09
+		ld e,a
+		call rtc_write_reg
 		pop hl
 
 	; month (3-letter name, offset 4..6)
@@ -4358,39 +4384,27 @@ sntp_real_time	pop hl			; hl -> string start, this is a real time now
 		add hl,de
 		push hl
 		pop ix
-		push bc
 		call month_to_bcd	; -> a = BCD month
-		pop bc
 		pop hl
-		push af
-		ld a,#08
-		ld b,#df
-		out (c),a
-		ld b,#bf
-		pop af
-		out (c),a
+		ld d,#08
+		ld e,a
+		call rtc_write_reg
 
 	; date of the month (offset 8..9, space-padded for single digits - and0
 	; code_time_rtc's "and #0f" happens to treat a leading space as digit 0)
 		push hl
 		ld de,8
 		add hl,de
-		ld a,#07
-		ld b,#df
-		out (c),a
-		ld b,#bf
 		call code_time_rtc
-		out (c),a
+		ld d,#07
+		ld e,a
+		call rtc_write_reg
 		pop hl
 
 	; hours (offset 11..12), adjusted by the configured GMT offset
 		push hl
 		ld de,11
 		add hl,de
-		ld a,#04
-		ld b,#df
-		out (c),a
-		ld b,#bf
 
 		ld a,(hl)
 		and #0f
@@ -4431,46 +4445,35 @@ gmt_time	add 0
 		rl e
 		rl e
 		or e
-		out (c),a
+		ld d,#04
+		ld e,a
+		call rtc_write_reg
 		pop hl
 
 	; minutes (offset 14..15)
 		push hl
 		ld de,14
 		add hl,de
-		ld a,#02
-		ld b,#df
-		out (c),a
-		ld b,#bf
 		call code_time_rtc
-		out (c),a
+		ld d,#02
+		ld e,a
+		call rtc_write_reg
 		pop hl
 
 	; seconds (offset 17..18)
 		push hl
 		ld de,17
 		add hl,de
-		ld a,#00
-		ld b,#df
-		out (c),a
-		ld b,#bf
 		call code_time_rtc
-		out (c),a
+		ld d,#00
+		ld e,a
+		call rtc_write_reg
 		pop hl
 
 	; register b
-		ld a,#0b
-		ld b,#df
-		out (c),a
-		ld a,#02
-		ld b,#bf
-		out (c),a
-
-		ld bc,#eff7
-		in a,(c)
-		and #7f
-		out (c),a
-		ei
+		ld d,#0b
+		ld e,#02
+		call rtc_write_reg
 
 		ld hl,ntp_synced_msg
 		ld b,1
@@ -4478,8 +4481,130 @@ gmt_time	add 0
 		xor a			; NC = NTP date was written to RTC
 		ret
 
+; Validate the complete ESP-AT asctime() payload before changing the RTC.
+; This rejects partial/garbled FIFO replies such as a year "20F0".  A bad
+; reply is retryable; it must never turn into a believable but wrong folder.
+; in: HL -> "Www Mmm dd hh:mm:ss yyyy"; out: NC = valid, C = invalid.
+sntp_validate_reply
+		push hl
+
+		; Exact day-of-week and month names.
+		push hl
+		pop ix
+		call day_of_week_index
+		jr c,.bad
+		pop hl
+		push hl
+		ld de,4
+		add hl,de
+		push hl
+		pop ix
+		call month_to_bcd
+		jr c,.bad
+		pop hl
+
+		; Day: a space is allowed only for 1..9, otherwise it is 01..31.
+		push hl
+		ld de,8
+		add hl,de
+		call sntp_day_bcd
+		jr c,.bad
+		cp #01
+		jr c,.bad
+		cp #32
+		jr nc,.bad
+		pop hl
+
+		; Hours/minutes/seconds must be strict decimal pairs in their ranges.
+		push hl
+		ld de,11
+		add hl,de
+		call sntp_bcd2
+		jr c,.bad
+		cp #24
+		jr nc,.bad
+		pop hl
+		push hl
+		ld de,14
+		add hl,de
+		call sntp_bcd2
+		jr c,.bad
+		cp #60
+		jr nc,.bad
+		pop hl
+		push hl
+		ld de,17
+		add hl,de
+		call sntp_bcd2
+		jr c,.bad
+		cp #60
+		jr nc,.bad
+		pop hl
+
+		; RTC holds a two-digit year, but accept only a real 20xx date (2020-2099).
+		push hl
+		ld de,20
+		add hl,de
+		ld a,(hl)
+		cp "2"
+		jr nz,.bad
+		inc hl
+		ld a,(hl)
+		cp "0"
+		jr nz,.bad
+		inc hl
+		call sntp_bcd2
+		jr c,.bad
+		cp #20
+		jr c,.bad
+		pop hl
+		or a
+		ret
+.bad		pop hl
+		scf
+		ret
+
+; Strict decimal pair at HL -> BCD.  HL is left after the two characters.
+sntp_bcd2	ld a,(hl)
+		sub "0"
+		jr c,.bad
+		cp 10
+		jr nc,.bad
+		rlca
+		rlca
+		rlca
+		rlca
+		ld b,a
+		inc hl
+		ld a,(hl)
+		sub "0"
+		jr c,.bad
+		cp 10
+		jr nc,.bad
+		or b
+		or a
+		ret
+.bad		scf
+		ret
+
+; Day accepts the ESP's space-padded single-digit form (" 5") too.
+sntp_day_bcd	ld a,(hl)
+		cp " "
+		jr nz,sntp_bcd2
+		inc hl
+		ld a,(hl)
+		sub "1"
+		jr c,.bad
+		cp 9
+		jr nc,.bad
+		inc a
+		or a
+		ret
+.bad		scf
+		ret
+
 ; in: ix -> 3-letter month name (e.g. from CIPSNTPTIME's reply)
-; out: a = BCD month 01-12 (clobbers af,bc,de,hl); defaults to January if not found
+; out: a = BCD month 01-12; C set if the name is not an English month.
 month_to_bcd	ld hl,month_names
 		ld c,1
 mtb_loop	ld a,(ix+0)
@@ -4502,16 +4627,18 @@ mtb_next	ld de,3
 		jr z,mtb_notfound
 		inc c
 		jr mtb_loop
-mtb_notfound	ld c,1
+mtb_notfound	scf
+		ret
 mtb_found	ld a,c
 		cp 10
 		jr c,mtb_done
 		sub 10
 		add a,#10
-mtb_done	ret
+mtb_done	or a
+		ret
 
 ; in: ix -> 3-letter day-of-week name (e.g. from CIPSNTPTIME's reply)
-; out: a = 0-6, 0=Sunday (clobbers af,bc,de,hl); defaults to Sunday if not found
+; out: a = 0-6, 0=Sunday (clobbers af,bc,de,hl); C set if not found
 day_of_week_index
 		ld hl,dow_names
 		ld c,0
@@ -4535,25 +4662,65 @@ dow_next	ld de,3
 		jr z,dow_notfound
 		inc c
 		jr dow_loop
-dow_notfound	ld c,0		; ran out of names - default to Sunday
+dow_notfound	scf
+		ret
 dow_found	ld a,c
+		or a
 		ret
 
 dow_names	db "SunMonTueWedThuFriSat"
 
 ntp_synced_msg	db "Time synced via NTP.",0,0
 
+; One RTC register per atomic section. The old single DI around the whole
+; NTP conversion suppressed the raster chain and exposed splash_copy.
+; D = CMOS register, E = value for write; clobbers AF/BC/DE.
+rtc_write_reg	di
+		ld bc,#eff7
+		in a,(c)
+		or #80
+		out (c),a
+		ld a,d
+		ld b,#df
+		out (c),a
+		ld a,e
+		ld b,#bf
+		out (c),a
+		ld bc,#eff7
+		in a,(c)
+		and #7f
+		out (c),a
+		ei
+		ret
+
+; A = CMOS register, returns A = value; preserves DE, clobbers BC.
+rtc_read_reg	push de
+		di
+		ld e,a
+		ld bc,#eff7
+		in a,(c)
+		or #80
+		out (c),a
+		ld a,e
+		ld b,#df
+		out (c),a
+		ld b,#bf
+		in a,(c)
+		ld e,a
+		ld bc,#eff7
+		in a,(c)
+		and #7f
+		out (c),a
+		ld a,e
+		pop de
+		ei
+		ret
+
 ; Reads the current date straight back off the RTC chip into DIR_date, as
 ; "20YY_MM_DD" - used to name the downloads/<date> folder. Works regardless of
 ; whether "time:" is "none" or the NTP sync above failed: the chip keeps
 ; ticking on its own battery either way, so this is the one source of truth.
 rtc_read_date
-		di
-		ld bc,#eff7
-		in a,(c)
-		or #80
-		out (c),a
-
 		ld de,DIR_date+1
 		ld a,"2"
 		ld (de),a
@@ -4563,37 +4730,22 @@ rtc_read_date
 		inc de
 	; year
 		ld a,#09
-		ld b,#df
-		out (c),a
-		ld b,#bf
-		in a,(c)
+		call rtc_read_reg
 		call bcd_to_ascii
 		ld a,"_"
 		ld (de),a
 		inc de
 	; month
 		ld a,#08
-		ld b,#df
-		out (c),a
-		ld b,#bf
-		in a,(c)
+		call rtc_read_reg
 		call bcd_to_ascii
 		ld a,"_"
 		ld (de),a
 		inc de
 	; date of the month
 		ld a,#07
-		ld b,#df
-		out (c),a
-		ld b,#bf
-		in a,(c)
+		call rtc_read_reg
 		call bcd_to_ascii
-
-		ld bc,#eff7
-		in a,(c)
-		and #7f
-		out (c),a
-		ei
 		ret
 
 bcd_to_ascii	; in: a = BCD byte, de = destination; writes 2 ASCII digits, advances de
