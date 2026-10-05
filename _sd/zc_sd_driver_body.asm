@@ -114,12 +114,17 @@ sd_v2		ld de,#01aa
 		or a
 		jr nz,sdinit_fail
 
-		; ACMD41 just succeeded (card left the busy state) -- read
-		; its OCR (4 more bytes, MSB-first) for the REAL CCS bit
+		; ACMD41 just succeeded (card left the busy state). CMD58 is
+		; mandatory here: without it the following four reads only sample
+		; idle SPI bytes (#ff) and falsely turn every v2 card into SDHC.
+		; Read its OCR (4 bytes, MSB-first) for the REAL CCS bit
 		; (bit 30 = bit 6 of the first byte) instead of assuming
 		; every card that speaks the v2 protocol is block-addressed.
 		; A genuine SDv2 card can still be an SDSC (<=2GB) card. See
 		; [[project-zifi-custom-sd-driver]].
+		call do_cmd58
+		or a
+		jr nz,sdinit_fail
 		ld bc,DATA
 		in a,(c)
 		bit 6,a
@@ -668,6 +673,9 @@ do_cmd8		ld hl,cmd08
 		jp send_frame
 do_cmd16	ld hl,cmd16
 		jp send_frame
+do_cmd58	ld a,%01000000+58
+		call cmdo
+		jp resp
 do_cmd1		ld a,%01000000+1
 		call cmdo
 		jp resp
@@ -910,15 +918,13 @@ vf_bad		xor a
 
 ;--- parse_bpb: reads BPB fields out of sdbuf (offsets per the standard
 ;--- FAT32 BPB layout), computes DataStartSector and RootDirSector as
-;--- true 32-bit values, and fills diag_buf for on-screen display.
+;--- true 32-bit values.
 ;--- FATSz32 alone can be tens of thousands of sectors on a real card
 ;--- (30MB+ FAT tables are normal) -- ReservedSectorCount + NumFATs*
 ;--- FATSz32 overflowed 16 bits on the first try (32 + 2*59430 =
 ;--- 118892 > 65535), silently wrapping to a wrong-but-in-range sector
 ;--- that just happened to read back as all zeroes. All the sector-
 ;--- number math below uses ADC HL,DE across (hi,lo) 16-bit halves. ---
-
-diag_buf	ds 20
 
 parse_bpb	ld hl,(sdbuf+32)	; TotalSectors32 low16 (u32 @ offset 32)
 		ld (total_sectors_lo),hl
@@ -927,47 +933,25 @@ parse_bpb	ld hl,(sdbuf+32)	; TotalSectors32 low16 (u32 @ offset 32)
 
 		ld hl,(sdbuf+14)	; ReservedSectorCount (u16)
 		ld (reserved_sectors),hl
-		ld a,h
-		ld (diag_buf+0),a
-		ld a,l
-		ld (diag_buf+1),a
 
 		ld hl,(sdbuf+48)	; FSInfoSector (u16, sector # within volume)
 		ld (fsinfo_sector),hl
 
 		ld a,(sdbuf+16)		; NumFATs (u8)
 		ld (num_fats),a
-		ld (diag_buf+2),a
 
 		ld a,(sdbuf+13)		; SectorsPerCluster (u8)
 		ld (sectors_per_cluster),a
-		ld (diag_buf+3),a
 
 		ld hl,(sdbuf+38)	; FATSz32 high16
 		ld (fatsz32_hi),hl
-		ld a,h
-		ld (diag_buf+4),a
-		ld a,l
-		ld (diag_buf+5),a
 		ld hl,(sdbuf+36)	; FATSz32 low16
 		ld (fatsz32_lo),hl
-		ld a,h
-		ld (diag_buf+6),a
-		ld a,l
-		ld (diag_buf+7),a
 
 		ld hl,(sdbuf+46)	; RootCluster high16
 		ld (root_cluster_hi),hl
-		ld a,h
-		ld (diag_buf+8),a
-		ld a,l
-		ld (diag_buf+9),a
 		ld hl,(sdbuf+44)	; RootCluster low16
 		ld (root_cluster_lo),hl
-		ld a,h
-		ld (diag_buf+10),a
-		ld a,l
-		ld (diag_buf+11),a
 
 		; NumFATs * FATSz32 (32-bit product via repeated 32-bit add --
 		; NumFATs is always tiny, 1 or 2, so this is at most 2 iterations)
@@ -998,10 +982,6 @@ mul1_done
 		ld de,(prod_hi)
 		adc hl,de
 		ld (data_start_hi),hl
-		ld a,h
-		ld (diag_buf+12),a
-		ld a,l
-		ld (diag_buf+13),a
 
 		; RootCluster - 2 (32-bit)
 		ld hl,(root_cluster_lo)
@@ -1043,15 +1023,6 @@ mul2_done
 		ld de,(prod2_hi)
 		adc hl,de
 		ld (root_dir_hi),hl
-		ld a,h
-		ld (diag_buf+14),a
-		ld a,l
-		ld (diag_buf+15),a
-		ld hl,(root_dir_lo)
-		ld a,h
-		ld (diag_buf+16),a
-		ld a,l
-		ld (diag_buf+17),a
 
 		; sd_lba_max = ADDTOP + TotalSectors32 -- one past the last
 		; valid absolute LBA on this card/partition. Computed here
@@ -4382,8 +4353,6 @@ cmkf_open_stream
 
 dot_name	db ".          "	; 11 bytes
 dotdot_name	db "..         "	; 11 bytes
-mkdir_sec_hi	dw 0
-mkdir_sec_lo	dw 0
 
 clear_dir_entry
 		ld hl,dir_entry_buf
