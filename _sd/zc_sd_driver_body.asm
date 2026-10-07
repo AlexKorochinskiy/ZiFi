@@ -37,7 +37,9 @@
 CONF		EQU #77
 DATA		EQU #57
 
-sdinit		call csh
+sdinit		xor a
+		ld (sd_block_addressed),a
+		call csh
 		ld de,512+10
 		call cycl
 
@@ -134,6 +136,9 @@ sd_v2		ld de,#01aa
 sd_v2_ocr_rest	in a,(c)	; discard the remaining 3 OCR bytes
 		in a,(c)
 		in a,(c)
+		ld a,(sd_block_addressed)
+		or a
+		jr z,sd_fbs	; SDv2 SDSC also requires a 512-byte block length
 
 sdinit_ok	call csh
 		xor a
@@ -145,12 +150,8 @@ sdinit_fail	call csh
 		ret
 
 ;--- set_lba32: HL=bits31-16, DE=bits15-0 -> stores into lba_arg (MSB
-;--- first). Do this BEFORE calling sdread_lba, not with the LBA sitting
-;--- in registers across the call -- csl calls wait, which uses DE as a
-;--- busy-loop counter and never restores it, so DE (and only DE) comes
-;--- back scrambled. That's exactly what broke the register-argument
-;--- version earlier: H/L survived, D/E didn't. Routing the argument
-;--- through memory instead sidesteps the whole problem. ---
+;--- first). Store the LBA before SD I/O: transfer routines use registers
+;--- for command framing and DMA setup. ---
 set_lba32	ld a,h
 		ld (lba_arg),a
 		ld a,l
@@ -611,6 +612,7 @@ csl		push bc
 
 wait		push bc
 		push af
+		push de		; preserve sdinit's retry counter across csl
 		ld bc,DATA
 		ld de,60000
 1		in a,(c)
@@ -620,7 +622,8 @@ wait		push bc
 		ld a,d
 		or e
 		jr nz,1b
-2		pop af
+2		pop de
+		pop af
 		pop bc
 		ret
 
@@ -1332,8 +1335,8 @@ ctf_bad		xor a
 ;--- get_next_cluster: reads the FAT32 table entry for the cluster in
 ;--- (cur_cluster_hi,cur_cluster_lo) and, if it isn't an end-of-chain
 ;--- marker, replaces cur_cluster_hi/lo with the next cluster. Sets
-;--- chain_ended=1 on end-of-chain (masked entry >=0x0FFFFFF8), an
-;--- out-of-range cluster, or a read error, 0 otherwise. ---
+;--- chain_ended=1 on EOC (masked entry >=0x0FFFFFF8), 2 on an
+;--- invalid link or read error, 0 on a valid next cluster. ---
 
 chain_ended	db 0
 nxt_lo		dw 0
@@ -1342,7 +1345,7 @@ nxt_hi		dw 0
 get_next_cluster
 		call cluster_to_fatpos
 		or a
-		jr nz,gnc_end
+		jr nz,gnc_bad
 
 		ld hl,(gnc_fatsec_hi)
 		ld de,(gnc_fatsec_lo)
@@ -1350,7 +1353,7 @@ get_next_cluster
 		call set_lba32
 		call sdread_lba
 		or a
-		jr nz,gnc_end
+		jr nz,gnc_bad
 
 		ld hl,(gnc_inoff)
 		ld de,sdbuf
@@ -1373,14 +1376,34 @@ get_next_cluster
 		cp #0f
 		jr nz,gnc_have_next
 		ld a,l
-		cp #f8
+		cp #ff
 		jr c,gnc_have_next
+		ld hl,(nxt_lo)
+		ld de,#fff0
+		or a
+		sbc hl,de
+		jr c,gnc_have_next
+		ld a,l		; #0FFFFFF0..7 are reserved/bad, not EOC
+		cp 8
+		jr c,gnc_bad
 
 gnc_end		ld a,1
+		jr gnc_stop
+gnc_bad		ld a,2
+gnc_stop
 		ld (chain_ended),a
 		ret
 
-gnc_have_next	ld hl,(nxt_lo)
+gnc_have_next	ld hl,(nxt_hi)
+		ld a,h
+		or l
+		jr nz,gnc_valid
+		ld hl,(nxt_lo)
+		ld de,2
+		or a
+		sbc hl,de
+		jr c,gnc_bad	; free/reserved links 0 and 1
+gnc_valid	ld hl,(nxt_lo)
 		ld (cur_cluster_lo),hl
 		ld hl,(nxt_hi)
 		ld (cur_cluster_hi),hl
@@ -1598,7 +1621,7 @@ write_fsinfo_hint
 		ld (sdbuf+488),hl
 		jr nc,wfi_skip_count
 		ld hl,(sdbuf+490)
-		ld de,1
+		ld de,0		; low-word subtraction already supplied the borrow
 		sbc hl,de
 		ld (sdbuf+490),hl
 
@@ -1970,9 +1993,9 @@ strm_calc_sector
 ;--- strm_advance: moves the stream position forward by one sector,
 ;--- crossing into the next cluster (via get_next_cluster) if that was
 ;--- the last sector of the current one. Sets stream_eoc=1 if the chain
-;--- ends there. Always returns A=0 (advancing itself can't fail --
-;--- get_next_cluster's own failure just means stream_eoc becomes 1,
-;--- which the NEXT read/write call reports). ---
+;--- ends there, or stream_eoc=2 on a broken link / FAT read error.
+;--- Returns A=0: the sector just transferred remains valid; the NEXT
+;--- read/write reports the stopped stream. Only EOC=1 permits growth. ---
 strm_advance	ld a,(stream_sec_in_cluster)
 		inc a
 		ld b,a			; b = candidate new sec_in_cluster
@@ -2086,6 +2109,8 @@ stream_data_save	ds 512	; scratch: the caller's pending sector data,
 
 stream_write_sector
 		ld a,(stream_eoc)
+		cp 2
+		ret nc		; a broken chain must never be extended
 		or a
 		jr z,strm_write_have
 
@@ -2172,6 +2197,8 @@ strm_write_have	call strm_calc_sector
 ;--- see dma_xfer_off's own comment above. ---
 stream_write_sector_from
 		ld a,(stream_eoc)
+		cp 2
+		ret nc
 		or a
 		jr z,strm_write_have2
 
@@ -3081,6 +3108,8 @@ find_free_run	call stream_open
 		ld (wne_cur_index_lo),hl
 
 ffr_sector_loop	ld a,(stream_eoc)
+		cp 2
+		jp nc,ffr_fail
 		or a
 		jr z,ffr_have_sector
 		call ffr_grow_dir

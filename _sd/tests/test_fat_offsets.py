@@ -20,9 +20,16 @@ class Driver:
         self.m = z80.Z80Machine()
         self.m.set_memory_block(0, BODY)
         self.disk = {}
+        self.fail_reads = set()
+        self.fail_writes = set()
+        self.io = []
         self.ram = bytearray(256 * 16384)
         self.hooks = {SYMS[n]: n for n in
-                      ('sdread_lba', 'sdread_lba_to', 'sdwrite_lba', 'write_fsinfo_hint')}
+                      ('sdread_lba', 'sdread_lba_to', 'sdwrite_lba',
+                       'sdwrite_lba_from', 'write_fsinfo_hint')}
+        self.hooks.update({SYMS[n]: n for n in
+                           ('sdwrite_multi_start', 'sdwrite_multi_block', 'sdwrite_multi_stop')})
+        self.multi_lba = None
         for address in [0xff00, *self.hooks]:
             self.m.set_breakpoint(address)
         self.put('reserved_sectors', 32)
@@ -59,9 +66,28 @@ class Driver:
             hook = self.hooks.get(self.m.pc)
             if not hook:
                 continue
-            if hook != 'write_fsinfo_hint':
+            failed = False
+            if hook == 'sdwrite_multi_start':
+                p = SYMS['lba_arg']
+                self.multi_lba = int.from_bytes(self.m.memory[p:p+4], 'big')
+            elif hook == 'sdwrite_multi_stop':
+                self.multi_lba = None
+            elif hook == 'sdwrite_multi_block':
+                assert self.multi_lba is not None
+                p = SYMS['sdbuf']
+                self.disk[self.multi_lba] = bytearray(self.m.memory[p:p+512])
+                self.io.append((hook, self.multi_lba))
+                self.multi_lba += 1
+            elif hook != 'write_fsinfo_hint':
                 lba = int.from_bytes(self.m.memory[SYMS['lba_arg']:SYMS['lba_arg']+4], 'big')
-                if hook == 'sdwrite_lba':
+                self.io.append((hook, lba))
+                failed = lba in (self.fail_reads if hook.startswith('sdread') else self.fail_writes)
+                if failed:
+                    pass
+                elif hook == 'sdwrite_lba_from':
+                    source = self.get('dma_xfer_page', 1)*16384 + (self.get('dma_xfer_off') & 16383)
+                    self.disk[lba] = self.ram[source:source+512]
+                elif hook == 'sdwrite_lba':
                     p = SYMS['sdbuf']
                     self.disk[lba] = bytearray(self.m.memory[p:p+512])
                 elif hook == 'sdread_lba':
@@ -72,9 +98,11 @@ class Driver:
                 else:
                     dest = self.get('dma_xfer_page', 1)*16384 + (self.get('dma_xfer_off') & 16383)
                     self.ram[dest:dest+512] = self.disk[lba]
-            self.m.af = 0x0040  # A=0, Z=1 (successful sector I/O)
+            self.m.af = 0x0100 if failed else 0x0040
             self.m.pc = int.from_bytes(self.m.memory[self.m.sp:self.m.sp+2], 'little')
             self.m.sp += 2
+            if self.m.pc == 0xff00:
+                return self.m.a
         raise AssertionError(f'{name}: execution did not return')
 
 

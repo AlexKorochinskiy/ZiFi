@@ -540,6 +540,8 @@ cfc_loop	ld hl,(cfc_cur_hi)
 		ld (cur_cluster_lo),hl
 		call get_next_cluster
 		ld a,(chain_ended)
+		cp 2
+		jr nc,cfc_fail	; do not free a link whose FAT read failed
 		or a
 		jr nz,cfc_nonext
 		ld hl,(cur_cluster_hi)
@@ -696,6 +698,8 @@ core_delfl	inc hl			; skip flag byte
 		ld hl,(fbn_cluster_lo)
 		ld (cur_cluster_lo),hl
 		call core_free_chain
+		or a
+		jr nz,cdf_fail
 
 		ld hl,(fbn_match_run_start_lo)
 		ld (cmdr_start_lo),hl
@@ -706,9 +710,13 @@ core_delfl	inc hl			; skip flag byte
 		ld hl,(active_dir_lo)
 		ld (cur_cluster_lo),hl
 		call core_mark_deleted_range
+		or a
+		jr nz,cdf_fail
 
 		xor a
 		inc a			; NZ -- FILE DELETED
+		ret
+cdf_fail	xor a			; Z -- deletion failed
 		ret
 
 ;--- core_renam: HL -> {flag(1),oldname(1-255),0}, DE -> {newname
