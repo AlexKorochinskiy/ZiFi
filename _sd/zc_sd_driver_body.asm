@@ -1278,7 +1278,7 @@ gnc_hi		dw 0
 gnc_lo		dw 0
 gnc_fatsec_hi	dw 0
 gnc_fatsec_lo	dw 0
-gnc_inoff	db 0
+gnc_inoff	dw 0		; FAT32 entry offset: 0..508, needs 9 bits
 
 cluster_to_fatpos
 		ld hl,(cur_cluster_hi)
@@ -1317,9 +1317,11 @@ ctf_shr		ld hl,(gnc_hi)
 		ld hl,(cur_cluster_lo)
 		ld a,l
 		and #7f
-		add a,a
-		add a,a
-		ld (gnc_inoff),a
+		ld l,a
+		ld h,0
+		add hl,hl
+		add hl,hl
+		ld (gnc_inoff),hl
 		xor a
 		ret
 
@@ -1350,9 +1352,7 @@ get_next_cluster
 		or a
 		jr nz,gnc_end
 
-		ld a,(gnc_inoff)
-		ld l,a
-		ld h,0
+		ld hl,(gnc_inoff)
 		ld de,sdbuf
 		add hl,de
 		ld a,(hl)
@@ -1435,9 +1435,7 @@ write_fat_entry
 		or a
 		jr nz,wfe_fail
 
-		ld a,(gnc_inoff)
-		ld l,a
-		ld h,0
+		ld hl,(gnc_inoff)
 		ld de,sdbuf
 		add hl,de
 		ld a,(new_val_lo)
@@ -1693,9 +1691,7 @@ ffc_scan	call cluster_to_fatpos
 		inc hl
 		ld (ffc_sectors_read),hl
 
-		ld a,(gnc_inoff)
-		ld l,a
-		ld h,0
+		ld hl,(gnc_inoff)
 		ld de,sdbuf
 		add hl,de
 		ld (ffc_ptr),hl
